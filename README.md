@@ -1,1 +1,3 @@
-# web_client_for_gan_model
+# Web Client for Our Gan Model
+
+
