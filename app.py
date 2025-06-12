@@ -7,6 +7,7 @@ import tempfile
 import os
 import subprocess
 from PIL import Image
+import time
 
 METRICS = None
 
@@ -184,6 +185,7 @@ def process_image(white_mask, original_image, current_display_image):
         return None, f"Error communicating with server: {str(e)}", None
 
 def run_evaluation():
+    time.sleep(1)  # Ensure the process has time to complete
     print("Output of the metrics:", METRICS)
     try:
         if not METRICS:
@@ -240,30 +242,32 @@ with gr.Blocks(title="Image Inpainting with Evaluation") as iface:
             
             with gr.Row():
                 reset_btn = gr.Button("Reset Mask")
-                create_mask_btn = gr.Button("Create White Mask")
+                process_btn = gr.Button("Process Image with Mask", variant="primary")
+                # create_mask_btn = gr.Button("Create White Mask")
             
             # Status message
-            status_msg = gr.Textbox(label="Status")
         
         with gr.Column(scale=1):
             # Output for the white mask
-            final_mask = gr.Image(type="numpy", label="White Mask")
+            final_mask = gr.Image(type="numpy", label="White Mask", visible=False)
             
             # Process button
-            process_btn = gr.Button("Process Image with Mask", variant="primary")
             
             # Output for the processed image
             processed_image = gr.Image(type="numpy", label="Processed Result", interactive=False)
     
     # Add a new row for side-by-side comparison
     with gr.Row():
-        comparison_view = gr.Image(type="numpy", label="Side-by-Side Comparison (Original with Mask vs. Generated)", interactive=False)
+        with gr.Column(scale=1):
+            comparison_view = gr.Image(type="numpy", label="Side-by-Side Comparison (Original with Mask vs. Generated)", interactive=False)
+        with gr.Column(scale=1):
+            eval_results = gr.Textbox(label="Evaluation Results", lines=10)
     
-    # Add evaluation section
+             
     with gr.Row():
-        eval_btn = gr.Button("Evaluate Image Quality", variant="secondary")
-        eval_results = gr.Textbox(label="Evaluation Results", lines=10)
-    
+        status_msg = gr.Textbox(label="Status")
+
+        
     # Set up event handlers
     image_display.upload(
         initialize,
@@ -283,32 +287,29 @@ with gr.Blocks(title="Image Inpainting with Evaluation") as iface:
         outputs=[image_display, mask_state, original_image_state, status_msg, final_mask, comparison_view]
     )
     
-    create_mask_btn.click(
+    ### STEP 1
+    # First create the white mask
+    mask_event = process_btn.click(
         get_white_mask,
         inputs=[image_display, mask_state, original_image_state],
         outputs=[final_mask, status_msg]
     )
     
-    # Replace this line in your code:
-    process_btn.click(
+    ### STEP 2
+    # Then process the image with the white mask
+    process_image_event = mask_event.then(
         process_image,
         inputs=[final_mask, original_image_state, image_display],  # Add image_display as third input
         outputs=[processed_image, status_msg, comparison_view]
     )
-    
-    eval_btn.click(
+
+    ### STEP 3
+    # After that run evaluation
+    process_image_event.then(
         run_evaluation,
         outputs=[eval_results]
     )
-    
-    # Add debug button to show the current output file
-    debug_btn = gr.Button("Debug: Show Current Output File")
-    
-    debug_btn.click(
-        lambda: display_file("tmp/output.jpg"),
-        inputs=[],
-        outputs=[processed_image, status_msg, comparison_view]
-    )
+        
 
 # Launch the app
 if __name__ == "__main__":
