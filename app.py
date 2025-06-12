@@ -1,3 +1,5 @@
+## client side
+
 import gradio as gr
 import numpy as np
 import cv2
@@ -6,10 +8,12 @@ import os
 import subprocess
 from PIL import Image
 
+METRICS = None
+
 def initialize(image):
     """Initialize when an image is uploaded"""
     if image is None:
-        return None, None, None, "Please upload an image.", None
+        return None, None, None, "Please upload an image.", None, None
     
     # Get the exact dimensions of the image
     height, width = image.shape[:2]
@@ -23,47 +27,43 @@ def initialize(image):
     # Log the dimensions for verification
     print(f"Image dimensions: {width}x{height}, Mask dimensions: {mask.shape[1]}x{mask.shape[0]}")
     
-    return image, mask, original_image, f"Image uploaded. Size: {width}x{height}px. Click on the image to create a mask.", None
+    return image, mask, original_image, f"Image uploaded. Size: {width}x{height}px. Click on the image to create a mask.", None, None
 
 def update_mask(image, mask, original_image, evt: gr.SelectData, brush_size):
-    """Add to the mask where the user clicks"""
     if image is None or mask is None:
-        return None, None, original_image, "Please upload an image first.", None
+        return None, None, original_image, "Please upload an image first.", None, None
     
-    # Get coordinates from the click event
     x, y = evt.index
-    
-    # Make a copy of the mask and update it
     updated_mask = mask.copy()
-    cv2.circle(updated_mask, (int(x), int(y)), brush_size, 255, -1)
     
-    # Create a visualization to show the user
-    # Always start with the original clean image to avoid accumulating visual artifacts
-    if original_image is not None:
-        visual = original_image.copy()
-    else:
-        visual = image.copy()
+    half_size = brush_size // 2
+    top_left = (max(0, int(x - half_size)), max(0, int(y - half_size)))
+    bottom_right = (min(updated_mask.shape[1]-1, int(x + half_size)), 
+                    min(updated_mask.shape[0]-1, int(y + half_size)))
     
-    white_areas = (updated_mask > 0)
+    # Draw a filled rectangle on the mask
+    cv2.rectangle(updated_mask, top_left, bottom_right, 255, -1)
     
-    # Add semi-transparent bright white overlay where mask exists
-    if white_areas.any():
-        # Using a brighter overlay (50% opacity) for better visibility
-        visual[white_areas] = visual[white_areas] * 0.5 + np.array([255, 255, 255], dtype=np.uint8) * 0.5
-    
-    return visual, updated_mask, original_image, f"Mask updated at ({x}, {y})", None
+    white_overlay = np.zeros_like(original_image)
+    mask_indices = np.where(updated_mask > 0)
+    white_overlay[mask_indices[0], mask_indices[1]] = [255, 255, 255]
+    visual = cv2.addWeighted(original_image, 1.0, white_overlay, 0.5, 0)
+
+
+    return visual, updated_mask, original_image, f"Mask updated at ({x}, {y}) with rectangular brush", None, None
+
 
 def reset_mask(original_image):
     """Reset to a blank mask and restore the original image"""
     if original_image is None:
-        return None, None, None, "Please upload an image first.", None
+        return None, None, None, "Please upload an image first.", None, None
     
     # Create a fresh blank mask
     mask = np.zeros((original_image.shape[0], original_image.shape[1]), dtype=np.uint8)
     
     # Return the clean original image with no overlays
     # Also return None for the final_mask to clear it
-    return original_image.copy(), mask, original_image, "Mask completely reset. All points cleared.", None
+    return original_image.copy(), mask, original_image, "Mask completely reset. All points cleared.", None, None
 
 def get_white_mask(image, mask, original_image):
     """Convert the mask to a white mask for output"""
@@ -121,75 +121,110 @@ def save_original_image(original_image):
     
     return input_path
 
-def process_image(white_mask, original_image):
-    """Process the image with the mask using the external model"""
+
+def process_image(white_mask, original_image, current_display_image):
+    """Send image and mask to Flask server and return processed output"""
+
+    global METRICS
+
     if white_mask is None or original_image is None:
-        return None, "Please create a mask first."
-    
+        return None, "Please create a mask first.", None
+
     try:
-        # Save original image
-        input_path = save_original_image(original_image)
-        
-        # Convert and save mask as NPY
-        npy_file_path, binary_mask = convert_and_save_mask_as_npy(white_mask)
-        
-        # Prepare output path
-        os.makedirs("tmp", exist_ok=True)
-        output_file_path = os.path.join("tmp", "output.jpg")
-        
-        # Run the model command - correct paths based on error message
-        cmd = [
-            "python", "python_model/predict_copy.py",
-            "python_model/model_cn", "python_model/config.json",
-            input_path, npy_file_path, output_file_path, "--img_size", "256"
-        ]
-        
-        # Print command for debugging
-        print(f"Running command: {' '.join(cmd)}")
-        
-        # Execute the command with more detailed error handling
-        try:
-            process = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            print(f"Command output: {process.stdout}")
-        except subprocess.CalledProcessError as e:
-            print(f"Command failed with exit code {e.returncode}")
-            print(f"STDOUT: {e.stdout}")
-            print(f"STDERR: {e.stderr}")
-            return None, f"Command failed: {e.stderr}"
-        
-        # Check if output file was created
-        if os.path.exists(output_file_path):
-            # Load the output image
-            processed_img = cv2.imread(output_file_path)
-            if processed_img is None:
-                print(f"Warning: cv2.imread returned None for {output_file_path}")
-                # Try with PIL as an alternative
-                try:
-                    from PIL import Image
-                    pil_img = Image.open(output_file_path)
-                    processed_img = np.array(pil_img)
-                    print(f"Successfully loaded image with PIL. Shape: {processed_img.shape}")
-                except Exception as pil_error:
-                    print(f"PIL loading also failed: {str(pil_error)}")
-                    return None, f"Error: Could not load output image. Try checking the file manually at {output_file_path}"
+        import requests
+        from PIL import Image
+
+        # Save the original image as JPEG
+        image_path = "tmp/uploaded_image.jpg"
+        Image.fromarray(original_image).save(image_path)
+
+        # Save the white mask as JPEG
+        mask_path = "tmp/uploaded_mask.jpg"
+        Image.fromarray(white_mask).save(mask_path, format='PNG')
+
+        # Send request to Flask server
+        url = "http://localhost:8090/process"
+        with open(image_path, 'rb') as image_file, open(mask_path, 'rb') as mask_file:
+            files = {
+                'image': image_file,
+                'mask': mask_file
+            }
+            response = requests.post(url, files=files)
+
+            if response.status_code == 200:
+                from io import BytesIO
+                import base64
+                import json
+                
+                # Parse JSON response
+                response_data = response.json()
+                
+                # Decode base64 image
+                img_bytes = base64.b64decode(response_data['image'])
+                processed_image = Image.open(BytesIO(img_bytes))
+                processed_np = np.array(processed_image)
+                
+                # Get metrics
+                METRICS = response_data['metrics']
+                # print(METRICS)
+                
+                # Use the current display image (which already has the correct overlay) 
+                masked_img = current_display_image if current_display_image is not None else original_image
+
+                # Resize processed image if dimensions don't match
+                if masked_img.shape != processed_np.shape:
+                    processed_np = cv2.resize(processed_np, (masked_img.shape[1], masked_img.shape[0]))
+
+                comparison = np.concatenate((masked_img, processed_np), axis=1)
+                return processed_np, "Image processed successfully!", comparison
             else:
-                # Convert from BGR to RGB for Gradio
-                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB)
-                print(f"Successfully loaded processed image. Shape: {processed_img.shape}")
-            
-            return processed_img, f"Image processed successfully! Output saved to {output_file_path}"
-        else:
-            print(f"Output file {output_file_path} does not exist!")
-            return None, f"Error: Output file not created at {output_file_path}"
-    
+                return None, f"Error: {response.text}", None
+
     except Exception as e:
-        print(f"Error processing image: {str(e)}")
-        return None, f"Error processing image: {str(e)}"
+        return None, f"Error communicating with server: {str(e)}", None
+
+def run_evaluation():
+    print("Output of the metrics:", METRICS)
+    try:
+        if not METRICS:
+            return "No metrics available. Please process an image first."
+        else:
+            wanted = {"PSNR:", "SSIM:", "MAE:"}
+            lines = []
+
+            # Walk the list and whenever we see a wanted key, grab its next element
+            for idx, token in enumerate(METRICS):
+                t = token.strip()
+                if t in wanted and idx + 1 < len(METRICS):
+                    val = METRICS[idx + 1].strip()
+                    lines.append(f"{t} {val}")
+
+            # Join them with commas and line-breaks
+            return ",\n".join(lines)
+        
+    except Exception as e:
+        return f"Error running evaluation: {str(e)}"
+
+# Function to display a file in Gradio
+def display_file(file_path):
+    """Load and display an image file in Gradio"""
+    if os.path.exists(file_path):
+        try:
+            img = cv2.imread(file_path)
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                return img, f"Successfully loaded image from {file_path}", None
+            else:
+                return None, f"Error: Could not load image from {file_path} (cv2.imread returned None)", None
+        except Exception as e:
+            return None, f"Error loading image: {str(e)}", None
+    else:
+        return None, f"Error: File does not exist at {file_path}", None
 
 # Create the Gradio interface
-with gr.Blocks(title="Mask Creator with Processing") as iface:
-    gr.Markdown("# Mask Creator with Processing")
-    gr.Markdown("Upload an image, click on it to create a mask, then process the image")
+with gr.Blocks(title="Image Inpainting with Evaluation") as iface:
+    gr.Markdown("# Image Inpainting with Evaluation")
+    gr.Markdown("Upload an image, click on it to create a rectangular mask, then process the image to fill the masked areas.")
     
     # Store the mask and original image as states (not visible to user)
     mask_state = gr.State(None)
@@ -198,10 +233,10 @@ with gr.Blocks(title="Mask Creator with Processing") as iface:
     with gr.Row():
         with gr.Column(scale=1):
             # The main image display (both input and visualization)
-            image_display = gr.Image(type="numpy", label="Click on the image to create mask")
+            image_display = gr.Image(type="numpy", label="Click on the image to create rectangular mask")
             
             # Controls for mask creation
-            brush_size = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Brush Size")
+            brush_size = gr.Slider(minimum=1, maximum=100, value=20, step=2, label="Rectangle Size")
             
             with gr.Row():
                 reset_btn = gr.Button("Reset Mask")
@@ -220,23 +255,32 @@ with gr.Blocks(title="Mask Creator with Processing") as iface:
             # Output for the processed image
             processed_image = gr.Image(type="numpy", label="Processed Result", interactive=False)
     
+    # Add a new row for side-by-side comparison
+    with gr.Row():
+        comparison_view = gr.Image(type="numpy", label="Side-by-Side Comparison (Original with Mask vs. Generated)", interactive=False)
+    
+    # Add evaluation section
+    with gr.Row():
+        eval_btn = gr.Button("Evaluate Image Quality", variant="secondary")
+        eval_results = gr.Textbox(label="Evaluation Results", lines=10)
+    
     # Set up event handlers
     image_display.upload(
         initialize,
         inputs=[image_display],
-        outputs=[image_display, mask_state, original_image_state, status_msg, final_mask]
+        outputs=[image_display, mask_state, original_image_state, status_msg, final_mask, comparison_view]
     )
     
     image_display.select(
         update_mask,
         inputs=[image_display, mask_state, original_image_state, brush_size],
-        outputs=[image_display, mask_state, original_image_state, status_msg, final_mask]
+        outputs=[image_display, mask_state, original_image_state, status_msg, final_mask, comparison_view]
     )
     
     reset_btn.click(
         reset_mask,
         inputs=[original_image_state],
-        outputs=[image_display, mask_state, original_image_state, status_msg, final_mask]
+        outputs=[image_display, mask_state, original_image_state, status_msg, final_mask, comparison_view]
     )
     
     create_mask_btn.click(
@@ -245,37 +289,26 @@ with gr.Blocks(title="Mask Creator with Processing") as iface:
         outputs=[final_mask, status_msg]
     )
     
-    # Add a debug button to show the current output file
-    debug_btn = gr.Button("Debug: Show Current Output File")
-    
+    # Replace this line in your code:
     process_btn.click(
         process_image,
-        inputs=[final_mask, original_image_state],
-        outputs=[processed_image, status_msg]
+        inputs=[final_mask, original_image_state, image_display],  # Add image_display as third input
+        outputs=[processed_image, status_msg, comparison_view]
     )
     
-    # Add debug button function to view output file directly
+    eval_btn.click(
+        run_evaluation,
+        outputs=[eval_results]
+    )
+    
+    # Add debug button to show the current output file
+    debug_btn = gr.Button("Debug: Show Current Output File")
+    
     debug_btn.click(
         lambda: display_file("tmp/output.jpg"),
         inputs=[],
-        outputs=[processed_image, status_msg]
+        outputs=[processed_image, status_msg, comparison_view]
     )
-
-# Function to display a file in Gradio
-def display_file(file_path):
-    """Load and display an image file in Gradio"""
-    if os.path.exists(file_path):
-        try:
-            img = cv2.imread(file_path)
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                return img, f"Successfully loaded image from {file_path}"
-            else:
-                return None, f"Error: Could not load image from {file_path} (cv2.imread returned None)"
-        except Exception as e:
-            return None, f"Error loading image: {str(e)}"
-    else:
-        return None, f"Error: File does not exist at {file_path}"
 
 # Launch the app
 if __name__ == "__main__":
